@@ -9,9 +9,9 @@ import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { CalendarIcon, Loader2, Info, ArrowRight } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, getCategoryIcon } from '@/lib/utils';
 import { getExpenses, getYearsWithExpenses } from '@/lib/sheets';
-import { Expense } from '@/lib/types';
+import { Expense, PAID_BY_OPTIONS } from '@/lib/types';
 import { useToast } from '@/hooks/use-toast';
 import { ExpenseList } from '@/components/expense-list';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -74,6 +74,23 @@ export default function DateRangeAnalysisPage() {
 
   const totalSum = useMemo(() => {
     return filteredExpenses.reduce((sum, expense) => sum + expense.amount, 0);
+  }, [filteredExpenses]);
+
+  const categoryTotals = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const expense of filteredExpenses) {
+      totals[expense.category] = (totals[expense.category] ?? 0) + expense.amount;
+    }
+    return Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  }, [filteredExpenses]);
+
+  const paidByTotals = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const expense of filteredExpenses) {
+      const key = expense.paidBy ?? 'Unknown';
+      totals[key] = (totals[key] ?? 0) + expense.amount;
+    }
+    return Object.entries(totals).sort((a, b) => b[1] - a[1]);
   }, [filteredExpenses]);
 
   return (
@@ -154,6 +171,65 @@ export default function DateRangeAnalysisPage() {
             ) : (
               <div className="text-4xl font-bold text-primary">
                 {totalSum.toLocaleString('en-IN', { style: 'currency', currency: 'INR' })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 md:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>By Category</CardTitle>
+            <CardDescription>Spending breakdown per category</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {isLoading ? (
+              <div className="flex justify-center p-6">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              </div>
+            ) : categoryTotals.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-4">No data for this range.</p>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {categoryTotals.map(([category, total]) => (
+                  <div key={category} className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {getCategoryIcon(category, {})}
+                      <span className="truncate">{category}</span>
+                    </div>
+                    <span className="font-medium whitespace-nowrap">
+                      {total.toLocaleString('en-IN', { style: 'currency', currency: 'INR' })}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>By Paid By</CardTitle>
+            <CardDescription>Spending breakdown per payer</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {isLoading ? (
+              <div className="flex justify-center p-6">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              </div>
+            ) : paidByTotals.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-4">No data for this range.</p>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {paidByTotals.map(([payer, total]) => (
+                  <div key={payer} className="flex items-center justify-between gap-2">
+                    <span className="truncate">{payer}</span>
+                    <span className="font-medium whitespace-nowrap">
+                      {total.toLocaleString('en-IN', { style: 'currency', currency: 'INR' })}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
           </CardContent>
