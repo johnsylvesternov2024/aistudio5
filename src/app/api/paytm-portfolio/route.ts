@@ -1,0 +1,455 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
+import { getStrategyAssignments } from '@/lib/sheets';
+import {
+  PAYTM_LOGIN_URL, API_ROUTES, MCP_TOOLS,
+  callPaytmAPI, logDebug, type Holding,
+} from '@/lib/paytm-shared';
+
+const COOKIE_NAME = 'paytm_read_access_token';
+const CLOCK_TOLERANCE_SECONDS = 120;
+
+interface SectorBreakdownEntry {
+  sector: string;
+  currentValue: number;
+  investmentValue: number;
+  pnl: number;
+  percent: number;
+}
+
+// Static fallback map used when the upstream Paytm payload doesn't include
+// a sector/industry field for a given symbol. Keyed by NSE/BSE trading symbol.
+const SECTOR_MAP: Record<string, string> = {
+  INFY: 'Technology', TCS: 'Technology', WIPRO: 'Technology', HCLTECH: 'Technology', TECHM: 'Technology', LTIM: 'Technology',
+  RELIANCE: 'Energy & Oil', ONGC: 'Energy & Oil', BPCL: 'Energy & Oil', IOC: 'Energy & Oil', GAIL: 'Energy & Oil',
+  HDFCBANK: 'Financial Services', ICICIBANK: 'Financial Services', SBIN: 'Financial Services', KOTAKBANK: 'Financial Services', AXISBANK: 'Financial Services', BAJFINANCE: 'Financial Services', INDUSINDBK: 'Financial Services',
+  HINDUNILVR: 'FMCG', ITC: 'FMCG', NESTLEIND: 'FMCG', BRITANNIA: 'FMCG', DABUR: 'FMCG',
+  SUNPHARMA: 'Pharma', DRREDDY: 'Pharma', CIPLA: 'Pharma', DIVISLAB: 'Pharma',
+  MARUTI: 'Automobile', TATAMOTORS: 'Automobile', 'M&M': 'Automobile', 'BAJAJ-AUTO': 'Automobile', EICHERMOT: 'Automobile',
+  BHARTIARTL: 'Telecom', IDEA: 'Telecom',
+  LT: 'Infrastructure', ADANIPORTS: 'Infrastructure', ULTRACEMCO: 'Infrastructure', GRASIM: 'Infrastructure',
+  TATASTEEL: 'Metals & Mining', JSWSTEEL: 'Metals & Mining', HINDALCO: 'Metals & Mining', COALINDIA: 'Metals & Mining',
+};
+
+function resolveSector(symbol: string, raw: Record<string, unknown>): string {
+  const rawSector = (raw.sector || raw.industry || raw.sector_name || raw.industry_name) as string | undefined;
+  if (rawSector && typeof rawSector === 'string' && rawSector.trim().length > 0) return rawSector.trim();
+  return SECTOR_MAP[symbol] || 'Others';
+}
+
+function computeSectorBreakdown(holdings: Holding[], totalCurrentValue: number): SectorBreakdownEntry[] {
+  const grouped = new Map<string, SectorBreakdownEntry>();
+  for (const h of holdings) {
+    const existing = grouped.get(h.sector) || { sector: h.sector, currentValue: 0, investmentValue: 0, pnl: 0, percent: 0 };
+    existing.currentValue += h.current_value;
+    existing.investmentValue += h.investment_value;
+    existing.pnl += h.pnl;
+    grouped.set(h.sector, existing);
+  }
+  return Array.from(grouped.values())
+    .map(entry => ({ ...entry, percent: totalCurrentValue > 0 ? (entry.currentValue / totalCurrentValue) * 100 : 0 }))
+    .sort((a, b) => b.currentValue - a.currentValue);
+}
+
+// --- Synthetic identity for symbol-less holdings ------------------------
+// Paytm reports trading_symbol as "NA" (or leaves it blank/"Unknown") for
+// several instrument types, chiefly bonds, so multiple holdings can share
+// the exact same literal symbol. Anything keyed on that raw value —
+// including drag-and-drop identity on the client and the "is this a new
+// holding" check below — needs a stable, unique display symbol instead.
+// Numbering comes from a deterministic sort (avg price, then quantity,
+// then invested value) rather than array order, so the same underlying
+// bond gets the same synthetic name across separate calls to this endpoint
+// even if Paytm returns holdings in a different order next time.
+function isMissingSymbol(symbol: string | null | undefined): boolean {
+  if (!symbol) return true;
+  const s = symbol.trim().toUpperCase();
+  return s === '' || s === 'NA' || s === 'N/A' || s === '-' || s === 'NULL' || s === 'UNKNOWN';
+}
+
+function syntheticPrefix(sector: string | null | undefined): string {
+  const word = (sector || '').trim().split(/\s+/)[0] || 'Asset';
+  return word.length > 3 && word.toLowerCase().endsWith('s') ? word.slice(0, -1) : word;
+}
+
+interface EnrichedHolding extends Holding {
+  display_symbol: string;
+  is_synthetic_symbol: boolean;
+  is_new_holding: boolean;
+  // Full/company name of the asset (e.g. "Infosys Limited" for INFY), used
+  // client-side purely for a hover tooltip over the (often cryptic) trading
+  // symbol. Falls back to the trading symbol itself when Paytm doesn't
+  // supply a distinct name for the instrument.
+  name: string;
+}
+
+function assignDisplaySymbols(holdings: Holding[]): { displaySymbol: string; isSynthetic: boolean }[] {
+  const groups = new Map<string, number[]>();
+  holdings.forEach((h, idx) => {
+    if (isMissingSymbol(h.trading_symbol)) {
+      const key = syntheticPrefix(h.sector);
+      const list = groups.get(key) || [];
+      list.push(idx);
+      groups.set(key, list);
+    }
+  });
+
+  const result = holdings.map((h) => ({ displaySymbol: h.trading_symbol, isSynthetic: false }));
+
+  groups.forEach((indices, prefix) => {
+    const sorted = [...indices].sort((a, b) => {
+      const ha = holdings[a], hb = holdings[b];
+      if (ha.average_price !== hb.average_price) return ha.average_price - hb.average_price;
+      if (ha.quantity !== hb.quantity) return ha.quantity - hb.quantity;
+      return ha.investment_value - hb.investment_value;
+    });
+    sorted.forEach((idx, i) => {
+      result[idx] = { displaySymbol: `${prefix}${i + 1}`, isSynthetic: true };
+    });
+  });
+
+  return result;
+}
+
+// Cross-checks each holding's display symbol against every symbol already
+// recorded in the "Strategy" Google Sheet (regardless of which strategy it
+// was assigned to). Anything absent from that sheet has never been seen or
+// categorized before, so it's flagged as a new holding right here, at the
+// point the Paytm response is processed — rather than inferred later on
+// the client. getStrategyAssignments() already swallows its own Sheets
+// errors and returns [], so a Sheets outage degrades to "nothing flagged
+// as new" instead of breaking the portfolio endpoint.
+async function enrichHoldings(holdings: Holding[], names: string[]): Promise<EnrichedHolding[]> {
+  const resolved = assignDisplaySymbols(holdings);
+
+  const assignments = await getStrategyAssignments();
+  const knownSymbols = new Set(assignments.filter((a) => a.symbol).map((a) => a.symbol));
+
+  return holdings.map((h, idx) => ({
+    ...h,
+    display_symbol: resolved[idx].displaySymbol,
+    is_synthetic_symbol: resolved[idx].isSynthetic,
+    is_new_holding: !knownSymbols.has(resolved[idx].displaySymbol),
+    name: names[idx] || h.trading_symbol,
+  }));
+}
+
+function decodeJwtTimestamps(token: string) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return { iatStr: null, expStr: null, rawIat: null, rawExp: null };
+
+    const payloadJson = Buffer.from(parts[1], 'base64').toString('utf-8');
+    const payload = JSON.parse(payloadJson);
+
+    return {
+      rawIat: payload.iat || null,
+      rawExp: payload.exp || null,
+      iatStr: payload.iat ? new Date(payload.iat * 1000).toISOString() : null,
+      expStr: payload.exp ? new Date(payload.exp * 1000).toISOString() : null,
+    };
+  } catch {
+    return { iatStr: null, expStr: null, rawIat: null, rawExp: null };
+  }
+}
+
+function isJwtExpired(token: string): boolean {
+  const meta = decodeJwtTimestamps(token);
+  if (!meta.rawExp) return true;
+  const expiryMs = meta.rawExp * 1000;
+  const bufferMs = 5 * 60 * 1000;
+  return Date.now() >= (expiryMs - bufferMs);
+}
+
+async function fetchHoldingsWithTime(readAccessToken: string): Promise<{ holdings: Holding[]; names: string[]; upstreamTime: string }> {
+  try {
+    console.log("=== [PAYTM API DEBUG] STARTING FETCH HOLDINGS CALL ===");
+    const holdingsRaw = await callPaytmAPI(API_ROUTES.holdings, readAccessToken);
+    
+    const fallbackTime = new Date().toISOString();
+    let rawHoldings: unknown[] = [];
+
+    if (Array.isArray(holdingsRaw)) {
+      rawHoldings = holdingsRaw;
+    } else if (holdingsRaw && typeof holdingsRaw === 'object') {
+      const anyRaw = holdingsRaw as Record<string, any>;
+      
+      // FIX: Added extraction path for Paytm Money's data.results structure
+      if (anyRaw.data && Array.isArray(anyRaw.data.results)) {
+        console.log("[PAYTM API DEBUG] Successfully extracted array from: holdingsRaw.data.results");
+        rawHoldings = anyRaw.data.results;
+      } else if (Array.isArray(anyRaw.data)) {
+        rawHoldings = anyRaw.data;
+      } else if (anyRaw.data && Array.isArray(anyRaw.data.holdings)) {
+        rawHoldings = anyRaw.data.holdings;
+      } else if (Array.isArray(anyRaw.holdings)) {
+        rawHoldings = anyRaw.holdings;
+      }
+    }
+
+    console.log(`[PAYTM API DEBUG] Final isolated holdings count for mapping loop: ${rawHoldings.length}`);
+
+    // Full/company name, kept in a parallel array (rather than on the
+    // Holding objects themselves) so the shape of `Holding` — and every
+    // downstream consumer typed against it — stays unchanged. Falls back
+    // through the same kind of fields Paytm uses for company/instrument
+    // names, and finally to the trading symbol itself.
+    const holdingNames: string[] = [];
+
+    const mappedHoldings: Holding[] = rawHoldings.map((raw) => {
+      const h = (raw || {}) as Record<string, unknown>;
+      const quantity = parseFloat((h.quantity || h.qty) as string) || 0;
+      const averagePrice = parseFloat((h.cost_price || h.average_price || h.avg_price) as string) || 0;
+      const lastPrice = parseFloat((h.last_traded_price || h.last_price || h.ltp) as string) || 0;
+      
+      const investmentValue = quantity * averagePrice;
+      const currentValue = quantity * lastPrice;
+      const calculatedPnl = currentValue - investmentValue;
+      
+      const pnl = typeof h.pnl !== 'undefined' ? parseFloat(h.pnl as string) : calculatedPnl;
+      const pnlPercent = typeof h.pnl_percent !== 'undefined' 
+        ? parseFloat(h.pnl_percent as string) 
+        : (investmentValue > 0 ? (calculatedPnl / investmentValue) * 100 : 0);
+
+      const tradingSymbol = (h.nse_symbol || h.bse_symbol || h.display_name || h.trading_symbol || 'Unknown') as string;
+
+      const fullName = (
+        h.company_name || h.companyName || h.instrument_name || h.instrumentName ||
+        h.security_name || h.securityName || h.description || h.name || tradingSymbol
+      ) as string;
+      holdingNames.push(fullName);
+
+      return {
+        trading_symbol: tradingSymbol,
+        exchange: (h.exchange && h.exchange !== 'ALL') ? (h.exchange as string) : (h.nse_symbol ? 'NSE' : 'BSE'),
+        quantity,
+        average_price: averagePrice,
+        last_price: lastPrice,
+        pnl,
+        pnl_percent: pnlPercent,
+        current_value: currentValue,
+        investment_value: investmentValue,
+        sector: resolveSector(tradingSymbol, h),
+      };
+    });
+
+    return {
+      holdings: mappedHoldings,
+      names: holdingNames,
+      upstreamTime: (holdingsRaw as { responseDate?: string })?.responseDate || fallbackTime
+    };
+  } catch (error: any) {
+    console.error("❌ [PAYTM API DEBUG] CRITICAL PIPELINE FAULT DETECTED:", error.message);
+    throw new Error(`Upstream API evaluation exception: ${error.message}`);
+  }
+}
+
+async function generateInsightsWithGemini(
+  holdings: Holding[],
+  totalInvestment: number,
+  totalCurrentValue: number,
+  totalPnl: number,
+  totalPnlPercent: number
+): Promise<{ insights: string; agentModel: string }> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return { insights: 'GEMINI_API_KEY not configured.', agentModel: 'none' };
+  if (holdings.length === 0) return { insights: 'No holdings records to analyze.', agentModel: 'gemini-2.5-flash' };
+
+  const prompt = `Analyze this portfolio brief: Investment ₹${totalInvestment}, Value ₹${totalCurrentValue}. Provide 3 short diagnostic observations.`;
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      }
+    );
+    const data = await response.json();
+    const insights = (data as any)?.candidates?.[0]?.content?.parts?.[0]?.text || 'AI insights unavailable.';
+    return { insights, agentModel: 'gemini-2.5-flash' };
+  } catch {
+    return { insights: 'Unable to parse AI insights.', agentModel: 'none' };
+  }
+}
+
+export async function POST(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const action = searchParams.get('action');
+  const cookieStore = await cookies();
+  const cookieToken = cookieStore.get(COOKIE_NAME);
+
+  if (action === 'execute_mcp_tool') {
+    if (!cookieToken?.value) {
+      return NextResponse.json({ error: 'Unauthorized: Session missing' }, { status: 401 });
+    }
+    try {
+      const body = await request.json();
+      const { toolName, arguments: toolArgs } = body;
+
+      const targetedTool = MCP_TOOLS.find(t => t.name === toolName);
+      if (!targetedTool) {
+        return NextResponse.json({ error: `Tool ${toolName} not defined in schema metadata bounds.` }, { status: 404 });
+      }
+
+      const resultPayload = await targetedTool.handler(toolArgs || {}, cookieToken.value);
+
+      return NextResponse.json({
+        success: true,
+        toolResult: resultPayload,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err: any) {
+      return NextResponse.json({ error: err.message || 'MCP execution pipeline failed' }, { status: 500 });
+    }
+  }
+
+  return NextResponse.json({ error: 'Method not supported' }, { status: 405 });
+}
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const action = searchParams.get('action');
+  const apiKey = process.env.PAYTM_MONEY_API_KEY;
+  const apiSecret = process.env.PAYTM_MONEY_SECRET;
+
+  const cookieStore = await cookies();
+  const cookieToken = cookieStore.get(COOKIE_NAME);
+
+  try {
+    if (action === 'status') {
+      const tokenValue = cookieToken?.value;
+      const tokenExpired = tokenValue ? isJwtExpired(tokenValue) : true;
+      const jwtMeta = tokenValue ? decodeJwtTimestamps(tokenValue) : null;
+
+      const configuredRefreshInterval = process.env.PORTFOLIO_REFRESH_INTERVAL_SECONDS 
+        ? parseInt(process.env.PORTFOLIO_REFRESH_INTERVAL_SECONDS, 10) 
+        : 300;
+
+      return NextResponse.json({
+        connected: !!(apiKey && apiSecret),
+        hasAccessToken: !!tokenValue,
+        tokenExpired,
+        apiKeyConfigured: !!apiKey,
+        secretConfigured: !!apiSecret,
+        geminiKeyConfigured: !!process.env.GEMINI_API_KEY,
+        proxyConfigured: !!process.env.WEBSHARE_PROXY_URL,
+        serverTimestamp: new Date().toISOString(),
+        jwtMeta,
+        tools: MCP_TOOLS.map(t => ({
+          name: t.name,
+          description: t.description || 'No description provided.',
+          inputSchema: (t as any).inputSchema || {}
+        })),
+        refreshIntervalSeconds: configuredRefreshInterval,
+      });
+    }
+
+    if (action === 'clear_token') {
+      cookieStore.delete(COOKIE_NAME);
+      return NextResponse.json({ success: true, message: 'Token cleared.' });
+    }
+
+    if (action === 'login_url') {
+      if (!apiKey) return NextResponse.json({ error: 'PAYTM_MONEY_API_KEY not configured' }, { status: 400 });
+      const state = searchParams.get('state') || Date.now().toString();
+      return NextResponse.json({
+        login_url: `${PAYTM_LOGIN_URL}?apiKey=${apiKey}&state=${state}`
+      });
+    }
+
+    if (action === 'exchange_token') {
+      const requestToken = searchParams.get('request_token');
+      if (!requestToken) return NextResponse.json({ error: 'Missing request_token' }, { status: 400 });
+      if (!apiKey || !apiSecret) return NextResponse.json({ error: 'API credentials not configured' }, { status: 500 });
+
+      const response = await fetch(`https://developer.paytmmoney.com${API_ROUTES.access_token}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'openapi-client-src': 'sdk',
+        },
+        body: JSON.stringify({ api_key: apiKey, api_secret_key: apiSecret, request_token: requestToken }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return NextResponse.json({ error: `Handshake rejected: ${errorText}` }, { status: 500 });
+      }
+
+      const tokenData = await response.json();
+      const readAccessToken = (tokenData as any).read_access_token;
+
+      if (readAccessToken) {
+        cookieStore.set(COOKIE_NAME, readAccessToken, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'strict',
+          maxAge: 86400 - CLOCK_TOLERANCE_SECONDS,
+          path: '/',
+        });
+        return NextResponse.json({ success: true, hasAccessToken: true });
+      }
+      return NextResponse.json({ error: 'No read-scoped access token payload returned' }, { status: 500 });
+    }
+
+    if (action === 'portfolio' || !action) {
+      if (!cookieToken || !cookieToken.value) {
+        return NextResponse.json({ error: 'No access token found.', oauthRequired: true }, { status: 401 });
+      }
+
+      if (isJwtExpired(cookieToken.value)) {
+        cookieStore.delete(COOKIE_NAME);
+        return NextResponse.json({
+          error: 'Access token expired. Please re-authenticate.',
+          tokenExpired: true,
+          oauthRequired: true,
+        }, { status: 401 });
+      }
+
+      const { holdings, names: holdingNames, upstreamTime } = await fetchHoldingsWithTime(cookieToken.value);
+      const totalInvestment = holdings.reduce((s, h) => s + h.investment_value, 0);
+      const totalCurrentValue = holdings.reduce((s, h) => s + h.current_value, 0);
+      const totalPnl = totalCurrentValue - totalInvestment;
+      const totalPnlPercent = totalInvestment > 0 ? (totalPnl / totalInvestment) * 100 : 0;
+
+      const { insights, agentModel } = await generateInsightsWithGemini(
+        holdings, totalInvestment, totalCurrentValue, totalPnl, totalPnlPercent
+      );
+
+      const sectorBreakdown = computeSectorBreakdown(holdings, totalCurrentValue);
+
+      // Resolve stable display symbols for symbol-less holdings (bonds
+      // reported as "NA", etc.) and check each one against the live
+      // Strategy sheet so "new holding" status is determined right here,
+      // against the source of truth, rather than guessed on the client.
+      let enrichedHoldings: EnrichedHolding[];
+      try {
+        enrichedHoldings = await enrichHoldings(holdings, holdingNames);
+      } catch (error) {
+        console.error('[PAYTM API DEBUG] Enrichment against Strategy sheet failed, falling back to raw holdings:', error);
+        enrichedHoldings = holdings.map((h, idx) => ({ ...h, display_symbol: h.trading_symbol, is_synthetic_symbol: false, is_new_holding: false, name: holdingNames[idx] || h.trading_symbol }));
+      }
+      const newHoldingsCount = enrichedHoldings.filter((h) => h.is_new_holding).length;
+
+      return NextResponse.json({
+        holdings: enrichedHoldings, totalInvestment, totalCurrentValue, totalPnl, totalPnlPercent,
+        insights, agentModel,
+        sectorBreakdown,
+        newHoldingsCount,
+        lastUpdated: new Date().toISOString(),
+        paytmApiTimestamp: upstreamTime,
+        jwtMeta: decodeJwtTimestamps(cookieToken.value),
+        source: 'Paytm Money MCP Scoped Server',
+      });
+    }
+
+    return NextResponse.json({ error: 'Invalid operation' }, { status: 400 });
+  } catch (e: any) {
+    const isTokenError = e.message.includes('expired') || e.message.includes('token') || e.message.includes('401');
+    if (isTokenError) cookieStore.delete(COOKIE_NAME);
+    return NextResponse.json({ error: e.message, tokenExpired: isTokenError, oauthRequired: isTokenError }, { status: isTokenError ? 401 : 500 });
+  }
+}
+

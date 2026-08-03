@@ -1,0 +1,1443 @@
+
+
+'use server';
+
+import { google } from 'googleapis';
+import type { Expense, Budget, ImportantDate } from './types';
+import { format, getYear } from 'date-fns';
+import { toZonedTime } from 'date-fns-tz';
+
+const TIME_ZONE = 'Asia/Kolkata';
+
+// Get credentials directly from environment variables
+const getCredentials = () => {
+  const clientEmail = process.env.GOOGLE_SHEETS_CLIENT_EMAIL;
+  const privateKey = process.env.GOOGLE_SHEETS_PRIVATE_KEY;
+  const sheetId = process.env.GOOGLE_SHEETS_SHEET_ID;
+
+  return { clientEmail, privateKey, sheetId };
+};
+
+const months = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+];
+
+const getAuth = async () => {
+  const { clientEmail, privateKey, sheetId } = getCredentials();
+
+  if (!clientEmail || !privateKey || !sheetId) {
+    throw new Error('Google Sheets API credentials or Sheet ID are not set. Add GOOGLE_SHEETS_CLIENT_EMAIL, GOOGLE_SHEETS_PRIVATE_KEY, and GOOGLE_SHEETS_SHEET_ID to environment variables.');
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: clientEmail,
+      private_key: privateKey.replace(/\\n/g, '\n'),
+    },
+    scopes: [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/documents.readonly'
+    ],
+  });
+  return auth;
+};
+
+const getSheetId = () => {
+  const { sheetId } = getCredentials();
+  return sheetId;
+};
+
+const getSheets = async () => {
+  const auth = await getAuth();
+  return google.sheets({ version: 'v4', auth });
+}
+
+async function getSheetIdByName(sheets: any, sheetId: string, sheetName: string): Promise<number | undefined> {
+    const response = await sheets.spreadsheets.get({
+        spreadsheetId: sheetId,
+    });
+    const sheet = response.data.sheets?.find((s: any) => s.properties?.title === sheetName);
+    return sheet?.properties?.sheetId;
+}
+
+async function ensureSheetExists(sheets: any, sheetId: string, sheetName: string, headers: string[]) {
+    try {
+        const sheetInfo = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+        const sheetExists = sheetInfo.data.sheets.some((s: any) => s.properties.title === sheetName);
+
+        if (!sheetExists) {
+            await sheets.spreadsheets.batchUpdate({
+                spreadsheetId: sheetId,
+                requestBody: {
+                    requests: [{ addSheet: { properties: { title: sheetName } } }],
+                },
+            });
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: sheetId,
+                range: `${sheetName}!A1`,
+                valueInputOption: 'RAW',
+                requestBody: {
+                    values: [headers],
+                },
+            });
+        }
+    } catch (error) {
+        console.error(`Error ensuring sheet "${sheetName}" exists. This may be due to an invalid SHEET_ID.`, error);
+        throw error;
+    }
+}
+
+function getSheetName(date: Date): string {
+    const year = getYear(date);
+    if (year < 2025) {
+        return `Transactions-${year}`;
+    }
+    const monthName = format(date, 'MMMM');
+    return `Transactions-${year}-${monthName}`;
+}
+
+function parseExpenseRows(rows: any[][] | null | undefined): Expense[] {
+    if (!rows || rows.length <= 1) {
+        return [];
+    }
+
+    const headers = rows[0];
+    const idIndex = headers.indexOf('id');
+    const dateIndex = headers.indexOf('date');
+    const descriptionIndex = headers.indexOf('description');
+    const categoryIndex = headers.indexOf('category');
+    const amountIndex = headers.indexOf('amount');
+    const paidIndex = headers.indexOf('paid');
+    const paidByIndex = headers.indexOf('paidby');
+
+    return rows.slice(1).map((row, index): Expense | null => {
+        if (row.every(cell => !cell)) return null;
+
+        const amount = parseFloat(row[amountIndex]);
+        if (isNaN(amount)) return null;
+
+        const category = row[categoryIndex] || 'Other';
+
+        const dateStr = row[dateIndex];
+        let date;
+        try {
+            date = toZonedTime(dateStr, TIME_ZONE).toISOString();
+        } catch (e) {
+            console.error(`Could not parse date "${dateStr}" at row ${index + 2}. Skipping row.`, e);
+            return null;
+        }
+
+        return {
+            id: row[idIndex] || (new Date().getTime() + index).toString(),
+            date: date,
+            description: row[descriptionIndex] || '',
+            category: category,
+            amount: amount,
+            paid: category === 'Credit Card' ? (paidIndex > -1 ? row[paidIndex] === 'Paid' : false) : undefined,
+            paidBy: paidByIndex > -1 ? (row[paidByIndex] || 'John') : 'John',
+        }
+    }).filter((e): e is Expense => e !== null);
+}
+
+
+export async function getExpenses(year: number): Promise<Expense[]> {
+  const sheets = await getSheets();
+  const sheetId = getSheetId();
+
+  if (!sheetId) {
+    throw new Error('Google Sheets Sheet ID not configured');
+  }
+
+  if (year < 2025) {
+    try {
+        const range = `Transactions-${year}`;
+        await ensureSheetExists(sheets, sheetId, range, ['id', 'date', 'description', 'category', 'amount', 'paid', 'paidby']);
+
+        const response = await sheets.spreadsheets.values.get({
+          spreadsheetId: sheetId,
+          range: range,
+        });
+
+        const expenses = parseExpenseRows(response.data.values);
+        return expenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    } catch (error: any) {
+        if (error.message && error.message.includes('Unable to parse range')) {
+            console.log(`Sheet for year ${year} likely doesn't exist. Returning empty array.`);
+            return [];
+        }
+        console.error('Error fetching expenses from Google Sheets:', error);
+        return [];
+    }
+  } else {
+    // For 2025 and after, fetch from all 12 monthly sheets
+    const promises = months.map(async (month) => {
+        const range = `Transactions-${year}-${month}`;
+        try {
+            const response = await sheets.spreadsheets.values.get({
+                spreadsheetId: sheetId,
+                range: range,
+            });
+            return parseExpenseRows(response.data.values);
+        } catch (error: any) {
+            if (error.message && (error.message.includes('Unable to parse range') || error.message.includes('not found'))) {
+                // Sheet for the month doesn't exist, which is fine.
+                return [];
+            }
+            console.error(`Error fetching expenses for ${month} ${year}:`, error);
+            return [];
+        }
+    });
+
+    const monthlyExpensesArrays = await Promise.all(promises);
+    const allExpenses = monthlyExpensesArrays.flat();
+
+    allExpenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    return allExpenses;
+  }
+}
+
+export async function addExpense(expense: Omit<Expense, 'id'>): Promise<Expense> {
+  const sheets = await getSheets();
+  const sheetId = getSheetId();
+
+  if (!sheetId) {
+    throw new Error('Google Sheets Sheet ID not configured');
+  }
+
+  const expenseDate = toZonedTime(new Date(expense.date), TIME_ZONE);
+  const range = getSheetName(expenseDate);
+
+  await ensureSheetExists(sheets, sheetId, range, ['id', 'date', 'description', 'category', 'amount', 'paid', 'paidby']);
+
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${range}!A:A`,
+  });
+
+  const existingIds = response.data.values ? response.data.values.flat().map(id => parseInt(id, 10)).filter(id => !isNaN(id)) : [];
+  const maxId = existingIds.length > 0 ? Math.max(0, ...existingIds) : 0;
+  const newId = maxId + 1;
+
+  const newExpense: Expense = {
+    ...expense,
+    id: newId.toString(),
+    paid: expense.category === 'Credit Card' ? !!expense.paid : undefined
+  };
+
+  const formattedDate = format(expenseDate, 'yyyy-MM-dd');
+
+  const newRow = [
+    newExpense.id,
+    formattedDate,
+    newExpense.description,
+    newExpense.category,
+    newExpense.amount,
+    newExpense.category === 'Credit Card' ? (newExpense.paid ? 'Paid' : 'Not Paid') : '',
+    newExpense.paidBy || 'John'
+  ];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range: range,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [newRow],
+    },
+  });
+
+  return newExpense;
+}
+
+async function findRowById(sheets: any, sheetId: string, rangeName: string, id: string): Promise<{rowIndex: number, range: string} | null> {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${rangeName}!A:A`,
+    });
+    const ids = response.data.values;
+    if (!ids) return null;
+    const rowIndex = ids.findIndex(row => row[0] === id);
+    return rowIndex !== -1 ? { rowIndex: rowIndex + 1, range: rangeName } : null;
+}
+
+
+export async function updateExpense(expense: Expense): Promise<Expense> {
+  const sheets = await getSheets();
+  const sheetId = getSheetId();
+
+  if (!sheetId) {
+    throw new Error('Google Sheets Sheet ID not configured');
+  }
+
+  const updatedDate = toZonedTime(new Date(expense.date), TIME_ZONE);
+  const range = getSheetName(updatedDate);
+
+  // This logic is simple and will fail if the date is changed across a sheet boundary (month or year).
+  // This matches the buggy behavior of the original code, which failed on year changes.
+  const found = await findRowById(sheets, sheetId, range, expense.id);
+
+  if (found === null) {
+    throw new Error('Expense not found to update');
+  }
+
+  const { rowIndex } = found;
+
+  const formattedDate = format(updatedDate, 'yyyy-MM-dd');
+  const paidValue = expense.category === 'Credit Card' ? (expense.paid ? 'Paid' : 'Not Paid') : '';
+  const updatedRow = [expense.id, formattedDate, expense.description, expense.category, expense.amount, paidValue, expense.paidBy || 'John'];
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `${range}!A${rowIndex}:G${rowIndex}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [updatedRow],
+    },
+  });
+
+  return expense;
+}
+
+export async function deleteExpense(expense: Expense, year?: number): Promise<void> {
+  const sheets = await getSheets();
+  const sheetId = getSheetId();
+
+  if (!sheetId) {
+    throw new Error('Google Sheets Sheet ID not configured');
+  }
+
+  const expenseDate = toZonedTime(new Date(expense.date), TIME_ZONE);
+  const range = getSheetName(expenseDate);
+
+  const found = await findRowById(sheets, sheetId, range, expense.id);
+
+  if (found === null) {
+    throw new Error('Expense not found to delete');
+  }
+
+  const { rowIndex } = found;
+
+  const targetSheetId = await getSheetIdByName(sheets, sheetId, range);
+
+  if (targetSheetId === undefined) {
+    throw new Error("Could not find sheet ID to delete row.");
+  }
+
+  await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+          requests: [
+              {
+                  deleteDimension: {
+                      range: {
+                          sheetId: targetSheetId,
+                          dimension: 'ROWS',
+                          startIndex: rowIndex - 1,
+                          endIndex: rowIndex,
+                      }
+                  }
+              }
+          ]
+      }
+  })
+}
+
+// --- CATEGORIES ---
+
+export async function getCategories(): Promise<string[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [];
+
+        const range = 'Categories';
+        await ensureSheetExists(sheets, sheetId, range, ['name']);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${range}!A2:A`,
+        });
+
+        const rows = response.data.values;
+        if (!rows) return [];
+
+        return rows.flat().filter(Boolean);
+    } catch (error) {
+        console.error('Error fetching categories:', error);
+        return [];
+    }
+}
+
+export async function addCategory(categoryName: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Categories';
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId: sheetId,
+        range: range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [[categoryName]],
+        },
+    });
+}
+
+export async function deleteCategory(categoryName: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Categories';
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:A`,
+    });
+
+    const categories = response.data.values;
+    if (!categories) {
+        throw new Error("Category sheet is empty.");
+    }
+
+    const rowIndex = categories.findIndex(row => row[0] === categoryName);
+
+    if (rowIndex === -1) {
+        throw new Error('Category not found to delete.');
+    }
+
+    const targetSheetId = await getSheetIdByName(sheets, sheetId, range);
+    if (targetSheetId === undefined) {
+        throw new Error(`Could not find sheet ID for "${range}" to delete row.`);
+    }
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            requests: [
+                {
+                    deleteDimension: {
+                        range: {
+                            sheetId: targetSheetId,
+                            dimension: 'ROWS',
+                            startIndex: rowIndex,
+                            endIndex: rowIndex + 1,
+                        }
+                    }
+                }
+            ]
+        }
+    });
+}
+
+
+// --- BUDGETS ---
+export async function getBudgets(): Promise<Budget[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [];
+
+        const range = 'Budgets';
+        await ensureSheetExists(sheets, sheetId, range, ['category', 'amount']);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${range}!A2:B`,
+        });
+
+        const rows = response.data.values;
+        if (!rows) return [];
+
+        return rows.map(row => ({
+            category: row[0],
+            amount: parseFloat(row[1]) || 0,
+        })).filter(b => b.category);
+    } catch (error) {
+        console.error('Error fetching budgets:', error);
+        return [];
+    }
+}
+
+export async function updateBudgets(budgets: Budget[]): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Budgets';
+
+    await sheets.spreadsheets.values.clear({
+        spreadsheetId: sheetId,
+        range: `${range}!A2:B`,
+    });
+
+    if(budgets.length === 0) return;
+
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${range}!A2`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: budgets.map(b => [b.category, b.amount]),
+        },
+    });
+}
+
+// --- MASTER PASSWORD ---
+
+const MASTER_PASSWORD_KEY = "masterPassword";
+
+export async function getMasterPassword(): Promise<string | null> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return null;
+
+        const range = 'Settings';
+        await ensureSheetExists(sheets, sheetId, range, ['key', 'value']);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${range}!A:B`,
+        });
+
+        const rows = response.data.values;
+        if (!rows || rows.length <= 1) {
+            return null;
+        }
+
+        const passwordRow = rows.find(row => row[0] === MASTER_PASSWORD_KEY);
+        return passwordRow ? passwordRow[1] : null;
+    } catch (error) {
+        console.error('Error getting master password:', error);
+        return null;
+    }
+}
+
+export async function setMasterPassword(password: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Settings';
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:A`,
+    });
+
+    const rows = response.data.values;
+    let rowIndex = rows ? rows.findIndex(row => row[0] === MASTER_PASSWORD_KEY) : -1;
+
+    if (rowIndex !== -1) {
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: sheetId,
+            range: `${range}!B${rowIndex + 1}`,
+            valueInputOption: 'RAW',
+            requestBody: {
+                values: [[password]],
+            },
+        });
+    } else {
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: sheetId,
+            range: range,
+            valueInputOption: 'RAW',
+            requestBody: {
+                values: [[MASTER_PASSWORD_KEY, password]],
+            },
+        });
+    }
+}
+
+export async function getYearsWithExpenses(): Promise<number[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [new Date().getFullYear()];
+
+        const response = await sheets.spreadsheets.get({
+            spreadsheetId: sheetId,
+        });
+
+        const sheetTitles = response.data.sheets?.map(s => s.properties?.title || '') || [];
+        const transactionYears = sheetTitles
+            .filter(title => title.startsWith('Transactions-'))
+            .map(title => parseInt(title.split('-')[1]))
+            .filter(year => !isNaN(year))
+            .sort((a, b) => b - a);
+
+        return transactionYears;
+    } catch (error) {
+        console.error('Error fetching sheet years:', error);
+        return [new Date().getFullYear()];
+    }
+}
+
+export async function searchAllExpenses(query: string): Promise<Omit<Expense, 'id' | 'paid'>[]> {
+  try {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) return [];
+
+    const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
+    const allSheetNames = spreadsheetInfo.data.sheets?.map(s => s.properties?.title || '') || [];
+
+    const transactionSheetNames = allSheetNames.filter(name => name.startsWith('Transactions-'));
+
+    if (transactionSheetNames.length === 0) {
+      return [];
+    }
+
+    const searchPromises = transactionSheetNames.map(sheetName =>
+      sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: sheetName,
+      })
+    );
+
+    const responses = await Promise.all(searchPromises);
+    const allResults: Omit<Expense, 'id' | 'paid'>[] = [];
+    const lowerCaseQuery = query.toLowerCase();
+
+    responses.forEach(response => {
+      const rows = response.data.values;
+      if (!rows || rows.length <= 1) return;
+
+      const headers = rows[0];
+      const descriptionIndex = headers.indexOf('description');
+      const dateIndex = headers.indexOf('date');
+      const categoryIndex = headers.indexOf('category');
+      const amountIndex = headers.indexOf('amount');
+
+      if ([descriptionIndex, dateIndex, categoryIndex, amountIndex].includes(-1)) {
+        return;
+      }
+
+      rows.slice(1).forEach(row => {
+        const description = row[descriptionIndex] || '';
+        if (description.toLowerCase().includes(lowerCaseQuery)) {
+           try {
+                const amount = parseFloat(row[amountIndex]);
+                if(isNaN(amount)) return;
+
+                allResults.push({
+                    description: description,
+                    amount: amount,
+                    category: row[categoryIndex] || 'Other',
+                    date: toZonedTime(new Date(row[dateIndex]), TIME_ZONE).toISOString(),
+                });
+            } catch (e) {
+                // Ignore rows with invalid data during search
+            }
+        }
+      });
+    });
+
+    // Sort by date descending
+    allResults.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    return allResults;
+  } catch (error) {
+    console.error('Error searching all expenses:', error);
+    throw new Error('Failed to search expenses across all sheets.');
+  }
+}
+
+export async function getAllSheetNames(spreadsheetId: string): Promise<string[]> {
+    try {
+        const sheets = await getSheets();
+        const response = await sheets.spreadsheets.get({
+            spreadsheetId: spreadsheetId,
+            fields: 'sheets(properties.title)', // Only fetch sheet titles
+        });
+        const sheetTitles = response.data.sheets?.map(s => s.properties?.title).filter((t): t is string => !!t) || [];
+        return sheetTitles;
+    } catch (error: any) {
+        console.error(`Error fetching all sheet names from ${spreadsheetId}:`, error.message);
+        if (error.message) {
+            if (error.message.includes('permission')) {
+                 throw new Error('Permission denied. Please ensure the Google Sheet is shared with the service account email.');
+            }
+             if (error.message.includes('not found')) {
+                 throw new Error(`The spreadsheet with ID "${spreadsheetId}" was not found. Please check the ID.`);
+            }
+            throw new Error(error.message);
+        }
+        throw new Error('An unknown error occurred while fetching the sheet names.');
+    }
+}
+
+
+export async function getFirstSheetName(spreadsheetId: string): Promise<string> {
+    try {
+        const sheetNames = await getAllSheetNames(spreadsheetId);
+        if (sheetNames.length === 0) {
+            throw new Error('Spreadsheet contains no sheets.');
+        }
+        return sheetNames[0];
+    } catch (error: any) {
+        // Re-throw the specific error from getAllSheetNames
+        throw error;
+    }
+}
+
+
+export async function getRawSheetData(spreadsheetId: string, range: string): Promise<string[][]> {
+    try {
+        const sheets = await getSheets();
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: spreadsheetId,
+            range: range,
+        });
+        return response.data.values || [];
+    } catch (error: any) {
+        console.error(`Error fetching raw sheet data from ${spreadsheetId} for range ${range}:`, error.message);
+        if (error.message) {
+            if (error.message.includes('permission')) {
+                 throw new Error('Permission denied. Please ensure the Google Sheet is shared with the service account email with "Editor" rights.');
+            }
+             if (error.message.includes('Unable to parse range')) {
+                 throw new Error(`The sheet tab (e.g., "Sheet1") was not found in the spreadsheet. Please check the sheet name.`);
+            }
+            throw new Error(error.message);
+        }
+        throw new Error('An unknown error occurred while fetching data from Google Sheet.');
+    }
+}
+
+export async function updateRawSheetData(spreadsheetId: string, range: string, values: string[][]): Promise<void> {
+    try {
+        const sheets = await getSheets();
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: spreadsheetId,
+            range: range,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: {
+                values: values,
+            },
+        });
+    } catch (error: any) {
+        console.error(`Error updating raw sheet data in ${spreadsheetId} for range ${range}:`, error.message);
+        if (error.message) {
+            if (error.message.includes('permission')) {
+                 throw new Error('Permission denied. Please ensure the Google Sheet is shared with the service account email with "Editor" rights.');
+            }
+             if (error.message.includes('Unable to parse range')) {
+                 throw new Error(`The sheet tab (e.g., "Sheet1") was not found in the spreadsheet. Please check the sheet name.`);
+            }
+            throw new Error(error.message);
+        }
+        throw new Error('An unknown error occurred while updating the Google Sheet.');
+    }
+}
+
+export async function getGoogleDocContent(documentId: string): Promise<any> {
+    try {
+        const auth = await getAuth();
+        const docs = google.docs({ version: 'v1', auth });
+
+        const response = await docs.documents.get({
+            documentId: documentId,
+        });
+
+        return response.data;
+    } catch (error: any) {
+        console.error(`Error fetching Google Doc content for document ${documentId}:`, error.message);
+        if (error.message) {
+            if (error.message.includes('permission')) {
+                 throw new Error('Permission denied. Please ensure the Google Doc is shared with the service account email with at least "Viewer" rights.');
+            }
+             if (error.message.includes('not found')) {
+                 throw new Error(`The document with ID "${documentId}" was not found. Please check the ID.`);
+            }
+            throw new Error(error.message);
+        }
+        throw new Error('An unknown error occurred while fetching the Google Doc.');
+    }
+}
+
+// --- IMPORTANT DATES ---
+
+function parseImportantDateRows(rows: any[][] | null | undefined): ImportantDate[] {
+    if (!rows || rows.length <= 1) {
+        return [];
+    }
+
+    const headers = rows[0];
+    const idIndex = headers.indexOf('id');
+    const titleIndex = headers.indexOf('title');
+    const dateIndex = headers.indexOf('date');
+    const descriptionIndex = headers.indexOf('description');
+    const priceIndex = headers.indexOf('price');
+    const shopIndex = headers.indexOf('shop');
+
+    return rows.slice(1).map((row, index): ImportantDate | null => {
+        if (row.every(cell => !cell)) return null;
+
+        return {
+            id: row[idIndex] || (new Date().getTime() + index).toString(),
+            title: row[titleIndex] || '',
+            date: row[dateIndex] || '',
+            description: row[descriptionIndex] || '',
+            price: row[priceIndex] ? parseFloat(row[priceIndex]) : undefined,
+            shop: row[shopIndex] || '',
+        }
+    }).filter((e): e is ImportantDate => e !== null);
+}
+
+export async function getImportantDates(sheetName: string): Promise<ImportantDate[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [];
+
+        await ensureSheetExists(sheets, sheetId, sheetName, ['id', 'title', 'date', 'description', 'price', 'shop']);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${sheetName}!A:F`,
+        });
+
+        return parseImportantDateRows(response.data.values);
+    } catch (error) {
+        console.error(`Error fetching important dates for "${sheetName}":`, error);
+        return [];
+    }
+}
+
+export async function addImportantDate(sheetName: string, dateData: Omit<ImportantDate, 'id'>): Promise<ImportantDate> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    await ensureSheetExists(sheets, sheetId, sheetName, ['id', 'title', 'date', 'description', 'price', 'shop']);
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${sheetName}!A:A`,
+    });
+
+    const existingIds = response.data.values ? response.data.values.flat().map(id => parseInt(id, 10)).filter(id => !isNaN(id)) : [];
+    const maxId = existingIds.length > 0 ? Math.max(0, ...existingIds) : 0;
+    const newId = maxId + 1;
+
+    const newDate: ImportantDate = { ...dateData, id: newId.toString() };
+    const newRow = [newDate.id, newDate.title, newDate.date, newDate.description || '', newDate.price || '', newDate.shop || ''];
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId: sheetId,
+        range: sheetName,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [newRow],
+        },
+    });
+
+    return newDate;
+}
+
+export async function updateImportantDate(sheetName: string, dateData: ImportantDate): Promise<ImportantDate> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const found = await findRowById(sheets, sheetId, sheetName, dateData.id);
+
+    if (found === null) {
+        throw new Error('Important date not found to update');
+    }
+
+    const { rowIndex } = found;
+    const updatedRow = [dateData.id, dateData.title, dateData.date, dateData.description || '', dateData.price || '', dateData.shop || ''];
+
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${sheetName}!A${rowIndex}:F${rowIndex}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [updatedRow],
+        },
+    });
+
+    return dateData;
+}
+
+export async function deleteImportantDate(sheetName: string, dateData: ImportantDate): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const found = await findRowById(sheets, sheetId, sheetName, dateData.id);
+
+    if (found === null) {
+        throw new Error('Important date not found to delete');
+    }
+
+    const { rowIndex } = found;
+    const targetSheetId = await getSheetIdByName(sheets, sheetId, sheetName);
+
+    if (targetSheetId === undefined) {
+        throw new Error(`Could not find sheet ID for "${sheetName}" to delete row.`);
+    }
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            requests: [
+                {
+                    deleteDimension: {
+                        range: {
+                            sheetId: targetSheetId,
+                            dimension: 'ROWS',
+                            startIndex: rowIndex - 1,
+                            endIndex: rowIndex,
+                        }
+                    }
+                }
+            ]
+        }
+    });
+}
+
+// --- SCRATCH NOTES ---
+
+function parseNoteRows(rows: any[][] | null | undefined): Note[] {
+    if (!rows || rows.length <= 1) {
+        return [];
+    }
+
+    const headers = rows[0];
+    const idIndex = headers.indexOf('id');
+    const contentIndex = headers.indexOf('content');
+    const dateIndex = headers.indexOf('date');
+
+    return rows.slice(1).map((row, index): Note | null => {
+        if (row.every(cell => !cell)) return null;
+
+        return {
+            id: row[idIndex] || (new Date().getTime() + index).toString(),
+            content: row[contentIndex] || '',
+            date: row[dateIndex] || '',
+        }
+    }).filter((e): e is Note => e !== null);
+}
+
+export async function getNotes(): Promise<Note[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [];
+
+        const range = 'ScratchNotes';
+        await ensureSheetExists(sheets, sheetId, range, ['id', 'content', 'date']);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${range}!A:C`,
+        });
+
+        return parseNoteRows(response.data.values);
+    } catch (error) {
+        console.error('Error fetching notes:', error);
+        return [];
+    }
+}
+
+export async function addNote(noteData: Omit<Note, 'id'>): Promise<Note> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'ScratchNotes';
+    await ensureSheetExists(sheets, sheetId, range, ['id', 'content', 'date']);
+
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:A`,
+    });
+
+    const existingIds = response.data.values ? response.data.values.flat().map(id => parseInt(id, 10)).filter(id => !isNaN(id)) : [];
+    const maxId = existingIds.length > 0 ? Math.max(0, ...existingIds) : 0;
+    const newId = maxId + 1;
+
+    const newNote: Note = { ...noteData, id: newId.toString() };
+    const newRow = [newNote.id, newNote.content, newNote.date];
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId: sheetId,
+        range: range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [newRow],
+        },
+    });
+
+    return newNote;
+}
+
+export async function updateNote(noteData: Note): Promise<Note> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'ScratchNotes';
+    const found = await findRowById(sheets, sheetId, range, noteData.id);
+
+    if (found === null) {
+        throw new Error('Note not found to update');
+    }
+
+    const { rowIndex } = found;
+    const updatedRow = [noteData.id, noteData.content, noteData.date];
+
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${range}!A${rowIndex}:C${rowIndex}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [updatedRow],
+        },
+    });
+
+    return noteData;
+}
+
+export async function deleteNote(noteId: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'ScratchNotes';
+    const found = await findRowById(sheets, sheetId, range, noteId);
+
+    if (found === null) {
+        throw new Error('Note not found to delete');
+    }
+
+    const { rowIndex } = found;
+    const targetSheetId = await getSheetIdByName(sheets, sheetId, range);
+
+    if (targetSheetId === undefined) {
+        throw new Error(`Could not find sheet ID for "${range}" to delete row.`);
+    }
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            requests: [
+                {
+                    deleteDimension: {
+                        range: {
+                            sheetId: targetSheetId,
+                            dimension: 'ROWS',
+                            startIndex: rowIndex - 1,
+                            endIndex: rowIndex,
+                        }
+                    }
+                }
+            ]
+        }
+    });
+}
+
+// --- PORTFOLIO STRATEGY ALLOCATION ---
+// Used by the Paytm Money Portfolio page to remember which "strategy" (e.g.
+// Coffee Can, Magic Formula, Dividend Income) each holding has been dragged
+// into. Lives in the existing "Strategy" tab of the same shared spreadsheet.
+//
+// Each row is either:
+//   - a strategy DEFINITION: symbol is blank, strategy names a bucket the
+//     user created (so it shows up even before anything is dropped into it)
+//   - a strategy ASSIGNMENT: symbol + strategy pairs a holding to a bucket.
+// A symbol can appear in multiple rows against different strategies, so one
+// asset can belong to more than one strategy at the same time (many-to-many).
+//
+// IMPORTANT: this tab has no reliable header row in practice — some rows
+// were written with the real values landing in different columns than
+// others. Rather than trust fixed column positions (which is what broke
+// this earlier), each row is parsed by CONTENT: the cell that looks like an
+// ISO timestamp is the date, a lone small integer is an old id/type marker
+// (ignored for display), and of what's left, the earlier column is the
+// symbol and the later one is the strategy — matching every row shape this
+// app has ever written, regardless of exactly which columns they landed in.
+// New rows are written in a fixed, simple [symbol, strategy, date] shape
+// going forward so this can't drift again.
+
+export interface StrategyAssignment {
+  id: string;
+  symbol: string; // '' means this row only declares the strategy, no holding assigned yet
+  strategy: string;
+  date: string;
+  // Quantity of the holding carved out for this particular assignment, used
+  // to split a single holding's quantity across more than one strategy at
+  // once. undefined means "the whole holding" (legacy rows, and rows that
+  // haven't been split) rather than a fixed slice of it.
+  quantity?: number;
+}
+
+const DEFAULT_STRATEGY_HEADERS = ['symbol', 'strategy', 'date', 'quantity'];
+const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const HEADER_WORDS = ['id', 'symbol', 'strategy', 'date', 'quantity'];
+// New rows are always written with quantity (if any) physically in column D
+// (0-based index 3), so parsing can pull it out by position instead of by
+// the same "single small integer" heuristic used for legacy marker cells —
+// that heuristic would otherwise be ambiguous with a genuine quantity value.
+const QUANTITY_COL_INDEX = 3;
+
+function looksLikeHeaderRow(values: string[]): boolean {
+    return values.length > 0 && values.every((v) => HEADER_WORDS.includes(v.toLowerCase()));
+}
+
+function parseStrategyRows(rows: any[][] | null | undefined): StrategyAssignment[] {
+    if (!rows || rows.length === 0) return [];
+
+    const assignments: StrategyAssignment[] = [];
+
+    rows.forEach((row, rowIdx) => {
+        if (!row) return;
+        const physicalRow = rowIdx + 1; // 1-based physical sheet row number
+
+        const cells = row
+            .map((cell, colIdx) => ({ value: (cell ?? '').toString().trim(), colIdx }))
+            .filter((c) => c.value !== '');
+
+        if (cells.length === 0) return;
+        if (looksLikeHeaderRow(cells.map((c) => c.value))) return; // skip an actual header row, if present
+
+        // Pull out the quantity cell first — it always lives in the fixed
+        // column D for rows this app writes, so it's identified by position
+        // rather than by the same content heuristics used below (which
+        // would otherwise mistake it for the old marker cell).
+        let quantityCell: { value: string; colIdx: number } | null = null;
+        const cellsAfterQuantity: typeof cells = [];
+        for (const c of cells) {
+            if (!quantityCell && c.colIdx === QUANTITY_COL_INDEX && /^\d+(\.\d+)?$/.test(c.value)) {
+                quantityCell = c;
+            } else {
+                cellsAfterQuantity.push(c);
+            }
+        }
+
+        // Pull out the date cell (the one that parses as an ISO timestamp).
+        let dateCell: { value: string; colIdx: number } | null = null;
+        const afterDate: typeof cells = [];
+        for (const c of cellsAfterQuantity) {
+            if (!dateCell && ISO_DATE_REGEX.test(c.value)) {
+                dateCell = c;
+            } else {
+                afterDate.push(c);
+            }
+        }
+
+        // Pull out a bare small-integer id/type marker left over from older
+        // row shapes (not needed for display — a fresh id is derived below).
+        let markerCell: { value: string; colIdx: number } | null = null;
+        const textCells: typeof cells = [];
+        for (const c of afterDate) {
+            if (!markerCell && /^\d{1,6}$/.test(c.value)) {
+                markerCell = c;
+            } else {
+                textCells.push(c);
+            }
+        }
+
+        textCells.sort((a, b) => a.colIdx - b.colIdx);
+
+        let symbol = '';
+        let strategy = '';
+        if (textCells.length >= 2) {
+            symbol = textCells[0].value;
+            strategy = textCells[textCells.length - 1].value;
+        } else if (textCells.length === 1) {
+            strategy = textCells[0].value;
+        }
+
+        if (!strategy) return; // every row must at least name a strategy
+
+        assignments.push({
+            id: `row-${physicalRow}`,
+            symbol,
+            strategy,
+            date: dateCell ? dateCell.value : '',
+            quantity: quantityCell ? parseFloat(quantityCell.value) : undefined,
+        });
+    });
+
+    return assignments;
+}
+
+export async function getStrategyAssignments(): Promise<StrategyAssignment[]> {
+    try {
+        const sheets = await getSheets();
+        const sheetId = getSheetId();
+
+        if (!sheetId) return [];
+
+        const range = 'Strategy';
+        // Only creates the tab (with default headers) if it doesn't exist yet —
+        // never touches an already-populated "Strategy" tab.
+        await ensureSheetExists(sheets, sheetId, range, DEFAULT_STRATEGY_HEADERS);
+
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${range}!A:Z`,
+        });
+
+        return parseStrategyRows(response.data.values);
+    } catch (error) {
+        console.error('Error fetching strategy assignments:', error);
+        return [];
+    }
+}
+
+export async function addStrategyAssignment(data: { symbol: string; strategy: string; quantity?: number }): Promise<StrategyAssignment> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Strategy';
+    await ensureSheetExists(sheets, sheetId, range, DEFAULT_STRATEGY_HEADERS);
+
+    const symbol = data.symbol.trim();
+    const strategy = data.strategy.trim();
+    const date = new Date().toISOString();
+    const quantity = typeof data.quantity === 'number' && !isNaN(data.quantity) ? data.quantity : undefined;
+
+    // Total rows used anywhere in the sheet (any column), so the new row's
+    // physical position — and therefore its id — is predictable regardless
+    // of which columns older rows happen to have data in.
+    const countResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:Z`,
+    });
+    const totalRows = countResponse.data.values?.length || 0;
+    const physicalRow = totalRows + 1;
+
+    await sheets.spreadsheets.values.append({
+        spreadsheetId: sheetId,
+        range: range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [[symbol, strategy, date, quantity ?? '']],
+        },
+    });
+
+    return { id: `row-${physicalRow}`, symbol, strategy, date, quantity };
+}
+
+// Updates an existing assignment row in place — used both to edit a split's
+// quantity and to rename/retarget a single assignment. Any field left out
+// of `updates` keeps its current value. Rewriting the full row (rather than
+// patching a single cell) also normalizes legacy rows into the fixed
+// [symbol, strategy, date, quantity] shape the moment they're touched.
+export async function updateStrategyAssignment(
+    id: string,
+    updates: { symbol?: string; strategy?: string; quantity?: number | null }
+): Promise<StrategyAssignment> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const match = id.match(/-(\d+)$/);
+    const physicalRow = match ? parseInt(match[1], 10) : NaN;
+    if (isNaN(physicalRow)) {
+        throw new Error('Strategy assignment not found to update');
+    }
+
+    const range = 'Strategy';
+    const rowResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A${physicalRow}:Z${physicalRow}`,
+    });
+    const current = parseStrategyRows(rowResponse.data.values)[0];
+    if (!current) {
+        throw new Error('Strategy assignment not found to update');
+    }
+
+    const symbol = updates.symbol !== undefined ? updates.symbol.trim() : current.symbol;
+    const strategy = updates.strategy !== undefined ? updates.strategy.trim() : current.strategy;
+    const quantity = updates.quantity !== undefined
+        ? (updates.quantity === null ? undefined : updates.quantity)
+        : current.quantity;
+    const date = current.date || new Date().toISOString();
+
+    await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${range}!A${physicalRow}:D${physicalRow}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+            values: [[symbol, strategy, date, quantity ?? '']],
+        },
+    });
+
+    return { id, symbol, strategy, date, quantity };
+}
+
+// Renames a strategy everywhere it appears — the definition row plus every
+// per-holding assignment row — in one pass. Also normalizes each touched
+// row into the fixed [symbol, strategy, date, quantity] shape.
+export async function renameStrategy(oldName: string, newName: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const trimmedNew = newName.trim();
+    const range = 'Strategy';
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:Z`,
+    });
+    const rows = parseStrategyRows(response.data.values).filter((a) => a.strategy === oldName);
+    if (rows.length === 0) return;
+
+    await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            valueInputOption: 'USER_ENTERED',
+            data: rows.map((a) => {
+                const physicalRow = parseInt(a.id.match(/-(\d+)$/)![1], 10);
+                return {
+                    range: `${range}!A${physicalRow}:D${physicalRow}`,
+                    values: [[a.symbol, trimmedNew, a.date, a.quantity ?? '']],
+                };
+            }),
+        },
+    });
+}
+
+// Deletes a strategy entirely: its definition row plus every per-holding
+// assignment row that references it. Any holdings that were only assigned
+// to this strategy fall back to Unassigned.
+export async function deleteStrategy(name: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const range = 'Strategy';
+    const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${range}!A:Z`,
+    });
+    const rows = parseStrategyRows(response.data.values).filter((a) => a.strategy === name);
+    if (rows.length === 0) return;
+
+    const targetSheetId = await getSheetIdByName(sheets, sheetId, range);
+    if (targetSheetId === undefined) {
+        throw new Error(`Could not find sheet ID for "${range}" to delete rows.`);
+    }
+
+    const physicalRows = rows
+        .map((a) => parseInt(a.id.match(/-(\d+)$/)![1], 10))
+        .sort((a, b) => b - a); // descending, so each delete doesn't shift the row index of the next one
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            requests: physicalRows.map((physicalRow) => ({
+                deleteDimension: {
+                    range: {
+                        sheetId: targetSheetId,
+                        dimension: 'ROWS',
+                        startIndex: physicalRow - 1,
+                        endIndex: physicalRow,
+                    },
+                },
+            })),
+        },
+    });
+}
+
+export async function deleteStrategyAssignment(id: string): Promise<void> {
+    const sheets = await getSheets();
+    const sheetId = getSheetId();
+
+    if (!sheetId) {
+      throw new Error('Google Sheets Sheet ID not configured');
+    }
+
+    const match = id.match(/-(\d+)$/);
+    const physicalRow = match ? parseInt(match[1], 10) : NaN;
+
+    if (isNaN(physicalRow)) {
+        throw new Error('Strategy assignment not found to delete');
+    }
+
+    const range = 'Strategy';
+    const targetSheetId = await getSheetIdByName(sheets, sheetId, range);
+    if (targetSheetId === undefined) {
+        throw new Error(`Could not find sheet ID for "${range}" to delete row.`);
+    }
+
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: {
+            requests: [
+                {
+                    deleteDimension: {
+                        range: {
+                            sheetId: targetSheetId,
+                            dimension: 'ROWS',
+                            startIndex: physicalRow - 1,
+                            endIndex: physicalRow,
+                        }
+                    }
+                }
+            ]
+        }
+    });
+}
+
+
+
